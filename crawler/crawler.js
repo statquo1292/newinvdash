@@ -12,13 +12,13 @@ const CRON_SCHEDULE  = process.env.CRON_SCHEDULE  || '*/30 * * * *';
 // strategy: 'dealercom'  → direct JSON API (no browser)
 // strategy: 'browser'    → Playwright + XHR interception
 const DEALERS = [
-  { name: 'George Kell Ford',        key: 'gkf',            city: 'Newport, AR',       base: 'https://www.georgekellford.com',        strategy: 'dealercom' },
-  { name: 'Cavenaugh Ford',           key: 'cavenaugh',      city: 'Jonesboro, AR',     base: 'https://www.cavenaughford.com',          strategy: 'dealercom' },
-  { name: 'Central Ford',             key: 'central',        city: 'Trumann, AR',       base: 'https://www.centralfordtrumann.com',    strategy: 'dealercom' },
-  { name: 'Red River Ford Cabot',     key: 'redriver_cabot', city: 'Cabot, AR',         base: 'https://www.redriverfordcabot.com',     strategy: 'dealercom' },
-  { name: 'Mark Martin Ford',         key: 'markmartin',     city: 'Batesville, AR',    base: 'https://www.markmartinfordar.com',      strategy: 'dealercom' },
-  { name: 'Riser Harness Ford',       key: 'riser',          city: 'Searcy, AR',        base: 'https://www.riserford.com',             strategy: 'dealercom' },
-  { name: 'Freedom Ford',             key: 'freedom',        city: 'Melbourne, AR',     base: 'https://www.freedomford.net',           strategy: 'dealercom' },
+  { name: 'George Kell Ford',        key: 'gkf',            city: 'Newport, AR',       base: 'https://www.georgekellford.com',        strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Cavenaugh Ford',           key: 'cavenaugh',      city: 'Jonesboro, AR',     base: 'https://www.cavenaughford.com',          strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Central Ford',             key: 'central',        city: 'Trumann, AR',       base: 'https://www.centralfordtrumann.com',    strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Red River Ford Cabot',     key: 'redriver_cabot', city: 'Cabot, AR',         base: 'https://www.redriverfordcabot.com',     strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Mark Martin Ford',         key: 'markmartin',     city: 'Batesville, AR',    base: 'https://www.markmartinfordar.com',      strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Riser Harness Ford',       key: 'riser',          city: 'Searcy, AR',        base: 'https://www.riserford.com',             strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
+  { name: 'Freedom Ford',             key: 'freedom',        city: 'Melbourne, AR',     base: 'https://www.freedomford.net',           strategy: 'dealercom', invPath: '/new-inventory/index.htm' },
   { name: 'Red River Ford Wynne',     key: 'redriver_wynne', city: 'Wynne, AR',         base: 'https://www.redriverfordtoyota.com',   strategy: 'browser',  invPath: '/new-inventory/index.htm' },
   { name: 'Crain Ford Jacksonville',  key: 'crain_jax',      city: 'Jacksonville, AR',  base: 'https://www.crainfordjacksonville.com', strategy: 'browser',  invPath: '/new-inventory/index.htm' },
   { name: 'Crain Ford Little Rock',   key: 'crain_lr',       city: 'Little Rock, AR',   base: 'https://www.crainfordoflittlerock.net', strategy: 'browser',  invPath: '/new-inventory/index.htm' },
@@ -212,9 +212,17 @@ async function crawl() {
     let notes    = '';
 
     try {
-      vehicles = dealer.strategy === 'dealercom'
-        ? await scrapeDealercom(dealer)
-        : await scrapeBrowser(dealer, browser);
+      if (dealer.strategy === 'dealercom') {
+        try {
+          vehicles = await scrapeDealercom(dealer);
+        } catch (apiErr) {
+          // Dealer.com blocks server-side requests with 403 — fall back to browser
+          process.stdout.write('(API blocked→browser) ');
+          vehicles = await scrapeBrowser(dealer, browser);
+        }
+      } else {
+        vehicles = await scrapeBrowser(dealer, browser);
+      }
 
       // Enforce Ford-only filter as final safety net
       vehicles = vehicles.filter(v => v.make === 'Ford' && v.msrp > 0);

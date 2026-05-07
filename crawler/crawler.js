@@ -1,6 +1,5 @@
 'use strict';
 
-const axios  = require('axios');
 const { chromium } = require('playwright');
 const cron   = require('node-cron');
 const fs     = require('fs');
@@ -66,86 +65,105 @@ function vdpUrl(base, link) {
   return link.startsWith('http') ? link : `${base}${link}`;
 }
 
-// ─── Dealer.com — direct JSON API ─────────────────────────────────────────────
-// Most Ford dealers on CDK Dealer.com expose a public inventory widget API.
-async function scrapeDealercom(dealer) {
-  const endpoint = `${dealer.base}/apis/widget/INVENTORY_LISTING_DEFAULT_AUTO_NEW/inventory/`;
-  const resp = await axios.get(endpoint, {
-    params: { make: 'Ford', new_used: 'N', start: 0, count: 999, _: Date.now() },
-    headers: {
-      'Accept': 'application/json, */*',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Referer': dealer.base,
-      'X-Requested-With': 'XMLHttpRequest',
-    },
-    timeout: 30000,
-  });
+// ─── Dealer.com — in-browser API call (bypasses 403) ─────────────────────────
+// Navigate to the dealer site first to get valid cookies/session, then call
+// the Dealer.com inventory API from inside the browser context so it sees
+// real browser headers and credentials instead of a server-side request.
+async function scrapeDealercom(dealer, browser) {
+  const page = await browser.newPage();
+  try {
+    // Load homepage to establish session/cookies
+    await page.goto(dealer.base, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(1500);
 
-  const raw = resp.data;
-  const items = raw.inventory || raw.vehicles || raw.items || [];
-  if (!Array.isArray(items)) throw new Error(`Unexpected shape: ${Object.keys(raw).join(',')}`);
+    // Call the API from inside the browser — has valid Origin, Referer, cookies
+    const raw = await page.evaluate(async (base) => {
+      const url = `${base}/apis/widget/INVENTORY_LISTING_DEFAULT_AUTO_NEW/inventory/` +
+                  `?make=Ford&new_used=N&start=0&count=999&_=${Date.now()}`;
+      const resp = await fetch(url, {
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        credentials: 'include',
+      });
+      if (!resp.ok) throw new Error(`${resp.status}`);
+      return resp.json();
+    }, dealer.base);
 
-  return items
-    .filter(v => (v.make || '').toUpperCase() === 'FORD')
-    .map(v => {
-      const p    = v.pricing || v.price || {};
-      const msrp = Number(p.msrp || p.MSRP || v.msrp || 0);
-      const sale = Number(p.sellingPrice || p.internetPrice || p.sale || v.sellingPrice || msrp);
-      const disc = Math.max(0, msrp - sale);
-      return {
-        dealer:          dealer.name,
-        dealer_key:      dealer.key,
-        city:            dealer.city,
-        year:            Number(v.year) || new Date().getFullYear(),
-        make:            'Ford',
-        model:           normalizeModel(v.model || ''),
-        trim:            (v.trim || '').replace(/[®™]/g, '').trim(),
-        body_style:      v.bodyStyle || v.body_style || '',
-        stock_number:    v.stockNumber || v.stock || '',
-        vin:             v.vin || '',
-        exterior_color:  v.extColor || v.exteriorColor || v.color || '',
-        msrp,
-        sale_price:      sale,
-        dealer_discount: disc,
-        discount_pct:    msrp > 0 ? Math.round((disc / msrp) * 1000) / 10 : 0,
-        vdp_url:         vdpUrl(dealer.base, v.links?.vdp || v.link?.href || v.vdp_url || v.href || ''),
-      };
-    });
+    const items = raw?.inventory || raw?.vehicles || raw?.items || [];
+    if (!Array.isArray(items)) throw new Error('Unexpected API shape');
+
+    return items
+      .filter(v => (v.make || '').toUpperCase() === 'FORD')
+      .map(v => {
+        const p    = v.pricing || v.price || {};
+        const msrp = Number(p.msrp || p.MSRP || v.msrp || 0);
+        const sale = Number(p.sellingPrice || p.internetPrice || p.sale || v.sellingPrice || msrp);
+        const disc = Math.max(0, msrp - sale);
+        return {
+          dealer:          dealer.name,
+          dealer_key:      dealer.key,
+          city:            dealer.city,
+          year:            Number(v.year) || new Date().getFullYear(),
+          make:            'Ford',
+          model:           normalizeModel(v.model || ''),
+          trim:            (v.trim || '').replace(/[®™]/g, '').trim(),
+          body_style:      v.bodyStyle || v.body_style || '',
+          stock_number:    v.stockNumber || v.stock || '',
+          vin:             v.vin || '',
+          exterior_color:  v.extColor || v.exteriorColor || v.color || '',
+          msrp,
+          sale_price:      sale,
+          dealer_discount: disc,
+          discount_pct:    msrp > 0 ? Math.round((disc / msrp) * 1000) / 10 : 0,
+          vdp_url:         vdpUrl(dealer.base, v.links?.vdp || v.link?.href || v.vdp_url || v.href || ''),
+        };
+      });
+  } finally {
+    await page.close();
+  }
 }
 
 // ─── Browser sites — Playwright + XHR interception ───────────────────────────
 // DealerSocket / VinSolutions sites load inventory via async XHR.
-// We intercept the JSON response in-flight instead of parsing the DOM.
+// Intercept every JSON response, collect all candidates, pick the largest set.
 async function scrapeBrowser(dealer, browser) {
   const page = await browser.newPage();
   const captured = [];
+  const pending  = [];
 
-  page.on('response', async (res) => {
-    try {
-      const ct = res.headers()['content-type'] || '';
-      if (!ct.includes('json')) return;
-      const u = res.url().toLowerCase();
-      if (!/inventor|vehicle|listing|getinv/i.test(u)) return;
-      const body = await res.json().catch(() => null);
-      if (!body) return;
-      const arr = body.inventory || body.vehicles || body.results ||
-                  body.data?.vehicles || (Array.isArray(body) ? body : null);
-      if (Array.isArray(arr) && arr.length > 0) captured.push(arr);
-    } catch {}
+  page.on('response', (res) => {
+    const ct = res.headers()['content-type'] || '';
+    if (!ct.includes('json')) return;
+    // Skip analytics / telemetry / font endpoints
+    const u = res.url();
+    if (/analytics|segment|beacon|pixel|telemetry|gtm|hotjar|font/i.test(u)) return;
+
+    const p = res.json()
+      .then(body => {
+        if (!body || typeof body !== 'object') return;
+        const arr = body.inventory || body.vehicles || body.results ||
+                    body.data?.vehicles || body.data?.inventory ||
+                    body.listings || body.items ||
+                    (Array.isArray(body) ? body : null);
+        if (Array.isArray(arr) && arr.length > 0) captured.push(arr);
+      })
+      .catch(() => {});
+    pending.push(p);
   });
 
-  const targetUrl = `${dealer.base}${dealer.invPath}?make=Ford&condition=new`;
+  const targetUrl = `${dealer.base}${dealer.invPath}?make=Ford&new_used=N`;
   try {
-    await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForTimeout(2500);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(5000); // let async inventory calls complete
+    await Promise.allSettled(pending); // drain response handlers
   } finally {
     await page.close();
   }
 
   if (captured.length === 0) return [];
 
-  const all = captured.reduce((acc, arr) => acc.concat(arr), []);
-  return all
+  // Pick the largest captured dataset (most likely the full inventory)
+  const best = captured.sort((a, b) => b.length - a.length)[0];
+  return best
     .filter(v => {
       const make = (v.make || v.Make || '').toLowerCase();
       return make === 'ford' || make === '' || make === 'f';
@@ -212,17 +230,9 @@ async function crawl() {
     let notes    = '';
 
     try {
-      if (dealer.strategy === 'dealercom') {
-        try {
-          vehicles = await scrapeDealercom(dealer);
-        } catch (apiErr) {
-          // Dealer.com blocks server-side requests with 403 — fall back to browser
-          process.stdout.write('(API blocked→browser) ');
-          vehicles = await scrapeBrowser(dealer, browser);
-        }
-      } else {
-        vehicles = await scrapeBrowser(dealer, browser);
-      }
+      vehicles = dealer.strategy === 'dealercom'
+        ? await scrapeDealercom(dealer, browser)
+        : await scrapeBrowser(dealer, browser);
 
       // Enforce Ford-only filter as final safety net
       vehicles = vehicles.filter(v => v.make === 'Ford' && v.msrp > 0);
@@ -267,6 +277,12 @@ async function crawl() {
     vehicles:          allVehicles,
     browser_needed_keys: DEALERS.filter(d => d.strategy === 'browser').map(d => d.key),
   };
+
+  // Only write if we got actual data — don't overwrite a good snapshot with zeros
+  if (allVehicles.length === 0) {
+    console.log('  ── No vehicles captured, keeping previous snapshot ──');
+    return;
+  }
 
   // Atomic write — avoids serving a partial file
   const tmp = OUTPUT_FILE + '.tmp';

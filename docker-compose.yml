@@ -2,7 +2,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3000:80"
+      - "8080:80"
     volumes:
       - inventory-data:/data:ro
     restart: unless-stopped

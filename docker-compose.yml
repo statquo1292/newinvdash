@@ -1,0 +1,22 @@
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    volumes:
+      - inventory-data:/data:ro
+    restart: unless-stopped
+    depends_on:
+      - crawler
+
+  crawler:
+    build: ./crawler
+    volumes:
+      - inventory-data:/data
+    environment:
+      - CRON_SCHEDULE=*/30 * * * *
+    shm_size: '1gb'
+    restart: unless-stopped
+
+volumes:
+  inventory-data:
